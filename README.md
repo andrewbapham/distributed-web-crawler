@@ -9,7 +9,7 @@ At the same time, I wanted to learn more about distributed systems and Kafka in 
 
 ## Architecture
 The architecture of the system is as follows:
-[Architecture sketch](distributed-web-crawler-architecture-sketch.png)
+![Architecture sketch](distributed-web-crawler-architecture-sketch.png)
 
 The system is made up of 2 main services:
 - Site fetching service:
