@@ -11,8 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.mongodb.org/mongo-driver/bson"
@@ -24,10 +28,6 @@ type MongoCollection struct {
 	collection *mongo.Collection
 }
 
-type KafkaClient struct {
-	client *kgo.Client
-}
-
 type SiteRecord struct {
 	URL           string `bson:"url"`
 	Hash          string `bson:"hash"`
@@ -36,17 +36,23 @@ type SiteRecord struct {
 	BackLinkCount int    `bson:"back_link_count"`
 }
 
-// mocking kafka stream of websites to visit
-var sites = []string{
-	"http://thophuongha.com/MuiSuaMe.html",
-	"http://thophuongha.com/AnhSangLaDay.html",
-	"http://thophuongha.com/XanhMauMat.html",
-	"http://thophuongha.com/ThuBruxelles.html",
+func getS3KeyFromLink(link string) (string, error) {
+	// extract host and path from link, e.g.
+	// removes protocol and query params
+	// https://google.com/search -> google.com/search
+	u, err := url.Parse(link)
+	if err != nil {
+		return "", err
+	}
+	return u.Host + u.Path, nil
 }
 
-func getWebsiteData(link string) string {
+func getWebsiteData(url string) string {
 	// fetch website data
-	res, err := http.Get(link)
+	if !strings.HasPrefix(url, "http") || !strings.HasPrefix(url, "https") {
+		url = "https://" + url
+	}
+	res, err := http.Get(url)
 	if err != nil {
 		log.Fatal("failed to fetch website data: %v", err)
 	}
@@ -58,9 +64,23 @@ func getWebsiteData(link string) string {
 	return string(content)
 }
 
-func handleSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient *kgo.Client) {
+func uploadToS3(html string, key string, s3Client *s3.Client) {
+	// upload to S3
+	_, err := s3Client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(os.Getenv("S3_BUCKET_NAME")),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(html),
+	})
+	if err != nil {
+		log.Fatal("failed to upload to S3: %v", err)
+	}
+
+	fmt.Printf("uploaded html from link: %v to S3\n", key)
+}
+
+func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
 	// fetch website data from kafka queue
-	html := getWebsiteData(link)
+	html := getWebsiteData(url)
 
 	h := sha256.New()
 	h.Write([]byte(html))
@@ -71,22 +91,28 @@ func handleSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient 
 	fmt.Println("hash: ", htmlHash)
 
 	newRecord := SiteRecord{
-		URL:         link,
+		URL:         url,
 		Hash:        htmlHash,
 		LastFetched: time.Now().Unix(),
 	}
 
 	var existingRecord SiteRecord
-	res := mongoClient.collection.FindOne(context.Background(), bson.D{{"url", link}})
+	res := mongoCollection.FindOne(context.Background(), bson.D{{Key: "url", Value: url}})
 	if res.Err() != nil && errors.Is(res.Err(), mongo.ErrNoDocuments) {
+		// record not found, insert to database
 		fmt.Println("record not found")
-		result, err := mongoClient.collection.InsertOne(context.Background(), newRecord)
+		result, err := mongoCollection.InsertOne(context.Background(), newRecord)
 		if err != nil {
-			log.Fatal("failed to insert record: %v", err)
+			log.Println("failed to insert record: %v", err)
+		} else {
+			log.Println("record inserted into mongo with id: ", result.InsertedID)
+			// upload to S3
+			uploadToS3(html, url, s3Client)
 		}
-		fmt.Println("record inserted: ", result.InsertedID)
+
 	} else if res.Err() != nil {
 		log.Fatal("record fetch failed: %v", res.Err())
+
 	} else {
 		// record found
 		res.Decode(&existingRecord)
@@ -95,11 +121,14 @@ func handleSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient 
 			fmt.Println("Hashes don't match, updating...")
 			// update hash
 			valuesToUpdate := bson.D{{Key: "hash", Value: htmlHash}, {Key: "last_fetched", Value: time.Now().Unix()}}
-			_, err := mongoClient.collection.UpdateOne(context.Background(), bson.D{{Key: "url", Value: link}}, bson.D{{Key: "$set", Value: valuesToUpdate}})
+			_, err := mongoCollection.UpdateOne(context.Background(), bson.D{{Key: "url", Value: url}}, bson.D{{Key: "$set", Value: valuesToUpdate}})
 
 			if err != nil {
 				log.Fatal("failed to update record: %v", err)
 			}
+
+			// upload to S3
+			uploadToS3(html, url, s3Client)
 		}
 	}
 	//res, _ := bson.MarshalExtJSON(result, false, false)
@@ -113,6 +142,22 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
+	/*
+		AWS CLIENT SETUP
+	*/
+
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Fatal("failed to aws load configuration, %v", err)
+	}
+
+	s3Client := s3.NewFromConfig(cfg)
+
+	fmt.Println("S3 client connected")
+
+	/*
+		KAFKA CLIENT SETUP
+	*/
 	seeds := []string{os.Getenv("KAFKA_BROKER")}
 
 	kafkaClient, err := kgo.NewClient(
@@ -129,6 +174,10 @@ func main() {
 
 	ctx := context.Background()
 
+	/*
+		MONGO CLIENT SETUP
+	*/
+
 	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URL")))
 	if err != nil {
 		log.Fatal("failed to connect to mongo: %v\n", err)
@@ -137,7 +186,7 @@ func main() {
 
 	fmt.Println("Mongo client connected")
 
-	sitesCollection := MongoCollection{collection: mongoClient.Database(os.Getenv("MONGO_DB_NAME")).Collection(os.Getenv("MONGO_COLLECTION_NAME"))}
+	sitesCollection := mongoClient.Database(os.Getenv("MONGO_DB_NAME")).Collection(os.Getenv("MONGO_COLLECTION_NAME"))
 
 	// Listen to incoming site queue and fetch data on new sites
 	for {
@@ -147,16 +196,15 @@ func main() {
 		}
 		iter := fetches.RecordIter()
 		for !iter.Done() {
-			fmt.Println("received record")
 			record := iter.Next()
+			fmt.Println("received record: " + string(record.Value))
 
-			url, err := url.ParseRequestURI(string(record.Value))
+			url, err := getS3KeyFromLink(string(record.Value))
 			if err != nil {
 				fmt.Printf("failed to parse URL: %v for record: %v, skipping...\n", err, string(record.Value))
 				continue
 			}
-			handleSiteFromQueue(url.String(), &sitesCollection, kafkaClient)
+			handleSiteFromQueue(url, sitesCollection, kafkaClient, s3Client)
 		}
-
 	}
 }
