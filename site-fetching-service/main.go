@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -27,13 +28,23 @@ type MongoCollection struct {
 	collection *mongo.Collection
 }
 
-type SiteRecord struct {
+type SiteKafkaMessage struct {
+	Link       string `json:"link"`
+	RetryCount int    `json:"retry_count"`
+}
+
+type SiteMongoRecord struct {
 	URL           string `bson:"url"`
 	Hash          string `bson:"hash"`
 	LastFetched   int64  `bson:"last_fetched"`
 	LastUpdated   int64  `bson:"last_updated"`
 	BackLinkCount int    `bson:"back_link_count"`
 }
+
+const (
+	MAX_RETRY_COUNT = 5
+	RETRY_TIMEOUT   = 5 * time.Second
+)
 
 func getS3KeyFromLink(link string) (string, error) {
 	// extract host and path from link, e.g.
@@ -46,21 +57,21 @@ func getS3KeyFromLink(link string) (string, error) {
 	return u.Host + u.Path, nil
 }
 
-func getWebsiteData(url string) string {
+func getWebsiteData(url string) (string, error) {
 	// fetch website data
 	if !strings.HasPrefix(url, "http") || !strings.HasPrefix(url, "https") {
 		url = "https://" + url
 	}
 	res, err := http.Get(url)
-	if err != nil {
-		log.Fatal("failed to fetch website data: %v", err)
+	if err != nil || res.StatusCode == 404 {
+		return "", errors.New("failed to fetch website data")
 	}
 	content, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
-		log.Fatal("failed to read website data: %v", err)
+		log.Fatalf("failed to read website data: %v", err)
 	}
-	return string(content)
+	return string(content), nil
 }
 
 func uploadToS3(html string, key string, s3Client *s3.Client) {
@@ -71,15 +82,80 @@ func uploadToS3(html string, key string, s3Client *s3.Client) {
 		Body:   strings.NewReader(html),
 	})
 	if err != nil {
-		log.Fatal("failed to upload to S3: %v", err)
+		log.Fatalf("failed to upload to S3: %v", err)
 	}
 
 	log.Printf("uploaded html from link: %v to S3\n", key)
 }
 
-func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
+func addSiteToDeadLetterQueue(site *SiteKafkaMessage, kafkaClient *kgo.Client) {
+	// add link to dead letter queue
+	kafkaClient.Produce(context.Background(), &kgo.Record{
+		Topic: os.Getenv("KAFKA_TOPIC_DLQ"),
+		Value: []byte(site.Link),
+	}, func(r *kgo.Record, err error) {
+		if err != nil {
+			log.Fatalf("failed to produce record: %v", err)
+		} else {
+			log.Printf("added link: %v to dead letter queue\n", site.Link)
+		}
+	},
+	)
+}
+
+func addSiteToRetryQueue(site *SiteKafkaMessage, kafkaClient *kgo.Client) {
+	// add link to retry queue
+	site.RetryCount++
+	if site.RetryCount > MAX_RETRY_COUNT {
+		log.Printf("retry count exceeded for link: %v, adding to dead letter queue\n", site.Link)
+		addSiteToDeadLetterQueue(site, kafkaClient)
+		return
+	}
+
+	messageJson, err := json.Marshal(site)
+	if err != nil {
+		log.Fatalf("failed to marshal site data: %v", err)
+	}
+	kafkaClient.Produce(context.Background(), &kgo.Record{
+		Topic: os.Getenv("KAFKA_TOPIC_FETCH"),
+		Value: []byte(messageJson),
+	}, func(r *kgo.Record, err error) {
+		if err != nil {
+			log.Fatalf("failed to produce record: %v", err)
+		} else {
+			log.Printf("added link: %v back to fetch queue\n", site.Link)
+		}
+	},
+	)
+}
+
+func unmarshalSiteKafkaMessage(record []byte) (SiteKafkaMessage, error) {
+	var message SiteKafkaMessage
+	err := json.Unmarshal(record, &message)
+	if err != nil {
+		return SiteKafkaMessage{}, err
+	}
+	return message, nil
+}
+
+func handleSiteFromQueue(site *SiteKafkaMessage, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
+	url, err := getS3KeyFromLink(site.Link)
+	if err != nil {
+		log.Printf("failed to parse URL: %v, skipping...\n", err)
+		return
+	}
 	// fetch website data from kafka queue
-	html := getWebsiteData(url)
+	html, err := getWebsiteData(url)
+	if err != nil && err.Error() == "failed to fetch website data" {
+		log.Printf("failed to fetch website data for link: %v, adding to retry queue\n", url)
+		go func() {
+			time.Sleep(RETRY_TIMEOUT)
+			addSiteToRetryQueue(site, kafkaClient)
+		}()
+		return
+	} else if err != nil {
+		log.Fatalf("failed to fetch website data for link: %v: %v\n", url, err)
+	}
 
 	h := sha256.New()
 	h.Write([]byte(html))
@@ -89,20 +165,20 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 	// if hash is different, update the hash and S3 object
 	log.Println("hash: ", htmlHash)
 
-	newRecord := SiteRecord{
+	newRecord := SiteMongoRecord{
 		URL:         url,
 		Hash:        htmlHash,
 		LastFetched: time.Now().Unix(),
 	}
 
-	var existingRecord SiteRecord
+	var existingRecord SiteMongoRecord
 	res := mongoCollection.FindOne(context.Background(), bson.D{{Key: "url", Value: url}})
 	if res.Err() != nil && errors.Is(res.Err(), mongo.ErrNoDocuments) {
 		// record not found, insert to database
 		log.Println("record not found")
 		result, err := mongoCollection.InsertOne(context.Background(), newRecord)
 		if err != nil {
-			log.Println("failed to insert record: %v", err)
+			log.Println("failed to insert record: ", err)
 		} else {
 			log.Println("record inserted into mongo with id: ", result.InsertedID)
 			// upload to S3
@@ -110,7 +186,7 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 		}
 
 	} else if res.Err() != nil {
-		log.Fatal("record fetch failed: %v", res.Err())
+		log.Fatal("record fetch failed: ", res.Err())
 
 	} else {
 		// record found
@@ -160,7 +236,7 @@ func main() {
 	kafkaClient, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("site-fetching-service"),
-		kgo.ConsumeTopics("websites"),
+		kgo.ConsumeTopics(os.Getenv("KAFKA_TOPIC_FETCH")),
 	)
 	if err != nil {
 		panic(err)
@@ -195,13 +271,12 @@ func main() {
 		for !iter.Done() {
 			record := iter.Next()
 			log.Println("received record: " + string(record.Value))
-
-			url, err := getS3KeyFromLink(string(record.Value))
+			siteData, err := unmarshalSiteKafkaMessage(record.Value)
 			if err != nil {
-				log.Printf("failed to parse URL: %v for record: %v, skipping...\n", err, string(record.Value))
+				log.Printf("failed to unmarshal site data: %v for record: %v, skipping...\n", err, string(record.Value))
 				continue
 			}
-			handleSiteFromQueue(url, sitesCollection, kafkaClient, s3Client)
+			handleSiteFromQueue(&siteData, sitesCollection, kafkaClient, s3Client)
 		}
 	}
 }
