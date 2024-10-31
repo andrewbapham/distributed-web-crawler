@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -75,7 +74,7 @@ func uploadToS3(html string, key string, s3Client *s3.Client) {
 		log.Fatal("failed to upload to S3: %v", err)
 	}
 
-	fmt.Printf("uploaded html from link: %v to S3\n", key)
+	log.Printf("uploaded html from link: %v to S3\n", key)
 }
 
 func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
@@ -88,7 +87,7 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 
 	// check if URL and hash already exist in database, and if not, insert and add S3 object
 	// if hash is different, update the hash and S3 object
-	fmt.Println("hash: ", htmlHash)
+	log.Println("hash: ", htmlHash)
 
 	newRecord := SiteRecord{
 		URL:         url,
@@ -100,7 +99,7 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 	res := mongoCollection.FindOne(context.Background(), bson.D{{Key: "url", Value: url}})
 	if res.Err() != nil && errors.Is(res.Err(), mongo.ErrNoDocuments) {
 		// record not found, insert to database
-		fmt.Println("record not found")
+		log.Println("record not found")
 		result, err := mongoCollection.InsertOne(context.Background(), newRecord)
 		if err != nil {
 			log.Println("failed to insert record: %v", err)
@@ -118,7 +117,7 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 		res.Decode(&existingRecord)
 
 		if existingRecord.Hash != htmlHash {
-			fmt.Println("Hashes don't match, updating...")
+			log.Println("Hashes don't match, updating...")
 			// update hash
 			valuesToUpdate := bson.D{{Key: "hash", Value: htmlHash}, {Key: "last_fetched", Value: time.Now().Unix()}}
 			_, err := mongoCollection.UpdateOne(context.Background(), bson.D{{Key: "url", Value: url}}, bson.D{{Key: "$set", Value: valuesToUpdate}})
@@ -131,8 +130,6 @@ func handleSiteFromQueue(url string, mongoCollection *mongo.Collection, kafkaCli
 			uploadToS3(html, url, s3Client)
 		}
 	}
-	//res, _ := bson.MarshalExtJSON(result, false, false)
-	//fmt.Println(string(res))
 
 }
 
@@ -153,7 +150,7 @@ func main() {
 
 	s3Client := s3.NewFromConfig(cfg)
 
-	fmt.Println("S3 client connected")
+	log.Println("S3 client connected")
 
 	/*
 		KAFKA CLIENT SETUP
@@ -170,7 +167,7 @@ func main() {
 	}
 	defer kafkaClient.Close()
 
-	fmt.Println("Kafka client connected")
+	log.Println("Kafka client connected")
 
 	ctx := context.Background()
 
@@ -184,7 +181,7 @@ func main() {
 	}
 	defer mongoClient.Disconnect(ctx)
 
-	fmt.Println("Mongo client connected")
+	log.Println("Mongo client connected")
 
 	sitesCollection := mongoClient.Database(os.Getenv("MONGO_DB_NAME")).Collection(os.Getenv("MONGO_COLLECTION_NAME"))
 
@@ -197,11 +194,11 @@ func main() {
 		iter := fetches.RecordIter()
 		for !iter.Done() {
 			record := iter.Next()
-			fmt.Println("received record: " + string(record.Value))
+			log.Println("received record: " + string(record.Value))
 
 			url, err := getS3KeyFromLink(string(record.Value))
 			if err != nil {
-				fmt.Printf("failed to parse URL: %v for record: %v, skipping...\n", err, string(record.Value))
+				log.Printf("failed to parse URL: %v for record: %v, skipping...\n", err, string(record.Value))
 				continue
 			}
 			handleSiteFromQueue(url, sitesCollection, kafkaClient, s3Client)
