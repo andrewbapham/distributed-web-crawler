@@ -1,6 +1,6 @@
 # Distributed Web Crawler
 
-My attempt at making a distributed web crawler using Golang, Kafka, MongoDB, and Elasticsearch.
+My attempt at making a distributed web crawler using Golang, Kafka, MongoDB, and AWS S3.
 
 ## Motivation
 Part of the motivation for this project was as part of building a new website for my grandfather's work, there was lots of content on many pages that would have to be transferred to the new website. I thought it would be a good idea to make a web crawler that would crawl the old website and store the content in a database. This way I could easily transfer the content to the new website.
