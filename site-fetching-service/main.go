@@ -138,6 +138,12 @@ func unmarshalSiteKafkaMessage(record []byte) (SiteKafkaMessage, error) {
 	return message, nil
 }
 
+func generateHash(html string) string {
+	h := sha256.New()
+	h.Write([]byte(html))
+	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+}
+
 func handleSiteFromQueue(site *SiteKafkaMessage, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
 	url, err := getS3KeyFromLink(site.Link)
 	if err != nil {
@@ -157,9 +163,7 @@ func handleSiteFromQueue(site *SiteKafkaMessage, mongoCollection *mongo.Collecti
 		log.Fatalf("failed to fetch website data for link: %v: %v\n", url, err)
 	}
 
-	h := sha256.New()
-	h.Write([]byte(html))
-	htmlHash := base64.URLEncoding.EncodeToString(h.Sum(nil))
+	htmlHash := generateHash(html)
 
 	// check if URL and hash already exist in database, and if not, insert and add S3 object
 	// if hash is different, update the hash and S3 object
