@@ -15,13 +15,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type MongoCollection struct {
@@ -219,49 +217,15 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
-	/*
-		AWS CLIENT SETUP
-	*/
-
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		log.Fatal("failed to aws load configuration, %v", err)
-	}
-
-	s3Client := s3.NewFromConfig(cfg)
-
-	log.Println("S3 client connected")
-
-	/*
-		KAFKA CLIENT SETUP
-	*/
-	seeds := []string{os.Getenv("KAFKA_BROKER")}
-
-	kafkaClient, err := kgo.NewClient(
-		kgo.SeedBrokers(seeds...),
-		kgo.ConsumerGroup("site-fetching-service"),
-		kgo.ConsumeTopics(os.Getenv("KAFKA_TOPIC_FETCH")),
-	)
-	if err != nil {
-		panic(err)
-	}
-	defer kafkaClient.Close()
-
-	log.Println("Kafka client connected")
-
 	ctx := context.Background()
+	connections := setup(ctx)
 
-	/*
-		MONGO CLIENT SETUP
-	*/
+	kafkaClient := connections.kafkaClient
+	s3Client := connections.s3Client
+	mongoClient := connections.mongoClient
 
-	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URL")))
-	if err != nil {
-		log.Fatal("failed to connect to mongo: %v\n", err)
-	}
+	defer kafkaClient.Close()
 	defer mongoClient.Disconnect(ctx)
-
-	log.Println("Mongo client connected")
 
 	sitesCollection := mongoClient.Database(os.Getenv("MONGO_DB_NAME")).Collection(os.Getenv("MONGO_COLLECTION_NAME"))
 
