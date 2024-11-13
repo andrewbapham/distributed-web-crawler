@@ -55,6 +55,12 @@ func getS3KeyFromLink(link string) (string, error) {
 	return u.Host + u.Path, nil
 }
 
+func generateHash(html string) string {
+	h := sha256.New()
+	h.Write([]byte(html))
+	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+}
+
 func getWebsiteData(url string) (string, error) {
 	// fetch website data
 	if !strings.HasPrefix(url, "http") || !strings.HasPrefix(url, "https") {
@@ -136,10 +142,51 @@ func unmarshalSiteKafkaMessage(record []byte) (SiteKafkaMessage, error) {
 	return message, nil
 }
 
-func generateHash(html string) string {
-	h := sha256.New()
-	h.Write([]byte(html))
-	return base64.URLEncoding.EncodeToString(h.Sum(nil))
+func uploadOrUpdateSiteRecord(html string, htmlHash string, url string, mongoCollection *mongo.Collection, s3Client *s3.Client) {
+	// check if URL and hash already exist in database, and if not, insert and add S3 object
+	// if hash is different, update the hash and S3 object
+	newRecord := SiteMongoRecord{
+		URL:         url,
+		Hash:        htmlHash,
+		LastFetched: time.Now().Unix(),
+	}
+
+	var existingRecord SiteMongoRecord
+	res := mongoCollection.FindOne(context.Background(), bson.D{{Key: "url", Value: url}})
+	if res.Err() != nil && errors.Is(res.Err(), mongo.ErrNoDocuments) {
+		// record not found, insert to database
+		log.Println("record not found")
+		result, err := mongoCollection.InsertOne(context.Background(), newRecord)
+		if err != nil {
+			log.Println("failed to insert record: ", err)
+		} else {
+			log.Println("record inserted into mongo with id: ", result.InsertedID)
+			// upload to S3
+			uploadToS3(html, url, s3Client)
+		}
+		return
+	} else if res.Err() != nil {
+		log.Fatal("record fetch failed: ", res.Err())
+		return
+	}
+
+	// record found
+	res.Decode(&existingRecord)
+
+	if existingRecord.Hash != htmlHash {
+		log.Println("Hashes don't match, updating...")
+		// update hash
+		valuesToUpdate := bson.D{{Key: "hash", Value: htmlHash}, {Key: "last_fetched", Value: time.Now().Unix()}}
+		_, err := mongoCollection.UpdateOne(context.Background(), bson.D{{Key: "url", Value: url}}, bson.D{{Key: "$set", Value: valuesToUpdate}})
+
+		if err != nil {
+			log.Fatalf("failed to update record: %v", err)
+		}
+
+		// upload to S3
+		uploadToS3(html, url, s3Client)
+	}
+
 }
 
 func handleSiteFromQueue(site *SiteKafkaMessage, mongoCollection *mongo.Collection, kafkaClient *kgo.Client, s3Client *s3.Client) {
@@ -163,52 +210,7 @@ func handleSiteFromQueue(site *SiteKafkaMessage, mongoCollection *mongo.Collecti
 
 	htmlHash := generateHash(html)
 
-	// check if URL and hash already exist in database, and if not, insert and add S3 object
-	// if hash is different, update the hash and S3 object
-	log.Println("hash: ", htmlHash)
-
-	newRecord := SiteMongoRecord{
-		URL:         url,
-		Hash:        htmlHash,
-		LastFetched: time.Now().Unix(),
-	}
-
-	var existingRecord SiteMongoRecord
-	res := mongoCollection.FindOne(context.Background(), bson.D{{Key: "url", Value: url}})
-	if res.Err() != nil && errors.Is(res.Err(), mongo.ErrNoDocuments) {
-		// record not found, insert to database
-		log.Println("record not found")
-		result, err := mongoCollection.InsertOne(context.Background(), newRecord)
-		if err != nil {
-			log.Println("failed to insert record: ", err)
-		} else {
-			log.Println("record inserted into mongo with id: ", result.InsertedID)
-			// upload to S3
-			uploadToS3(html, url, s3Client)
-		}
-
-	} else if res.Err() != nil {
-		log.Fatal("record fetch failed: ", res.Err())
-
-	} else {
-		// record found
-		res.Decode(&existingRecord)
-
-		if existingRecord.Hash != htmlHash {
-			log.Println("Hashes don't match, updating...")
-			// update hash
-			valuesToUpdate := bson.D{{Key: "hash", Value: htmlHash}, {Key: "last_fetched", Value: time.Now().Unix()}}
-			_, err := mongoCollection.UpdateOne(context.Background(), bson.D{{Key: "url", Value: url}}, bson.D{{Key: "$set", Value: valuesToUpdate}})
-
-			if err != nil {
-				log.Fatal("failed to update record: %v", err)
-			}
-
-			// upload to S3
-			uploadToS3(html, url, s3Client)
-		}
-	}
-
+	uploadOrUpdateSiteRecord(html, htmlHash, url, mongoCollection, s3Client)
 }
 
 func main() {
@@ -233,7 +235,7 @@ func main() {
 	for {
 		fetches := kafkaClient.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
-			log.Fatal("fetches had errors: %v\n", errs)
+			log.Fatalf("fetches had errors: %v", errs)
 		}
 		iter := fetches.RecordIter()
 		for !iter.Done() {
