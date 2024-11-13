@@ -3,15 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/url"
 	"os"
 	"strings"
-	"sync"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/net/html"
 )
 
 type MongoCollection struct {
@@ -30,24 +37,116 @@ type SiteRecord struct {
 	Content       string `bson:"content"`
 }
 
-func processSiteFromQueue(siteData string, mongoClient *MongoCollection, kafkaClient *kgo.Client) {
-	textLines := strings.Split(siteData, "\n")
-	var bodyStart int
-	var bodyEnd int
-	for idx, line := range textLines {
-		if strings.Contains(line, "<body>") {
-			bodyStart = idx
-		} else if strings.Contains(line, "</body>") {
-			bodyEnd = idx
-		} else if strings.Contains(line, "href") {
-			fmt.Println("Found link: ", line)
-			addLinkToFetchQueue(line)
-		}
+func getS3KeyFromLink(link string) (string, error) {
+	// extract host and path from link, e.g.
+	// removes protocol and query params
+	// https://google.com/search -> google.com/search
+	u, err := url.Parse(link)
+	if err != nil {
+		return "", err
+	}
+	return u.Host + u.Path, nil
+}
+
+func getSiteDataFromS3(key string, s3Client *s3.Client) (io.ReadCloser, error) {
+	// get raw html from s3
+	result, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(os.Getenv("S3_BUCKET_NAME")),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	record := SiteRecord{
+	return result.Body, nil
+}
 
+func addLinkToFetchQueue(link string, kafkaClient *kgo.Client) {
+	fmt.Println("Adding link to fetch queue: ", link)
+	kafkaClient.Produce(context.Background(), &kgo.Record{
+		Topic: os.Getenv("KAFKA_TOPIC_FETCH"),
+		Value: []byte(link),
+	}, func(record *kgo.Record, err error) {
+		if err != nil {
+			log.Printf("failed to produce record: %v\n", err)
+		}
+	},
+	)
+}
 
+func processHtml(htmlTokenizer *html.Tokenizer, kafkaClient *kgo.Client) string {
+	// parse html
+	previousStartToken := htmlTokenizer.Token()
+	textContent := ""
+tokenParseLoop:
+	for {
+		tokenType := htmlTokenizer.Next()
+		if tokenType == html.ErrorToken {
+			break tokenParseLoop
+		}
+		if tokenType == html.StartTagToken {
+			token := htmlTokenizer.Token()
+			previousStartToken = token
+			if token.Data == "a" {
+				for _, attr := range token.Attr {
+					if attr.Key == "href" {
+						fmt.Println("Found link: ", attr.Val)
+						addLinkToFetchQueue(attr.Val, kafkaClient)
+					}
+				}
+			}
+		} else if tokenType == html.TextToken {
+			if previousStartToken.Data == "script" || previousStartToken.Data == "style" {
+				continue
+			}
+			tokenTextContent := strings.TrimSpace(html.UnescapeString(string(htmlTokenizer.Text())))
+			if tokenTextContent != "" {
+				textContent += tokenTextContent + " "
+			}
+		}
+	}
+	return textContent
+}
+
+func processSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient *kgo.Client, s3Client *s3.Client) {
+	fmt.Println("Processing site: ", link)
+	siteLink, err := getS3KeyFromLink(link)
+	if err != nil {
+		log.Printf("failed to parse URL: %v, skipping...\n", err)
+		return
+	}
+
+	// get raw html from s3
+	s3Result, err := getSiteDataFromS3(siteLink, s3Client)
+	if err != nil {
+		log.Printf("failed to get site data from S3: %v, skipping...\n", err)
+		return
+	}
+	defer s3Result.Close()
+
+	htmlTokenizer := html.NewTokenizer(s3Result)
+
+	textContent := processHtml(htmlTokenizer, kafkaClient)
+	fmt.Println("extracted text content: ", textContent)
+
+	// update site record in mongo
+	res, err := mongoClient.collection.UpdateOne(
+		context.Background(),
+		bson.D{{Key: "url", Value: siteLink}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "content", Value: textContent},
+			{Key: "last_updated", Value: time.Now().Unix()},
+		}}},
+	)
+	if err != nil {
+		log.Fatalf("failed to update record: %v", err)
+	}
+
+	if res.MatchedCount == 0 {
+		log.Fatalf("record not found for link %v", siteLink)
+	}
+
+	fmt.Println("updated site record for site ", link)
 }
 
 func main() {
@@ -56,36 +155,38 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
+	ctx := context.Background()
+
+	//s3 connection
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatal("failed to aws load configuration, %v", err)
+	}
+
+	s3Client := s3.NewFromConfig(cfg)
+	fmt.Println("S3 client connected")
+
 	seeds := []string{os.Getenv("KAFKA_BROKER")}
 
 	kafkaClient, err := kgo.NewClient(
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("site-fetching-service"),
-		kgo.ConsumeTopics("websites"),
+		kgo.ConsumeTopics(os.Getenv("KAFKA_TOPIC_PROCESS")),
 	)
 	if err != nil {
 		panic(err)
 	}
+	fmt.Println("Kafka client connected")
 	defer kafkaClient.Close()
-
-	ctx := context.Background()
 
 	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URL")))
 	if err != nil {
 		log.Fatal("failed to connect to mongo: %v\n", err)
 	}
+	fmt.Println("Mongo client connected")
 	defer mongoClient.Disconnect(ctx)
 
 	sitesCollection := MongoCollection{collection: mongoClient.Database(os.Getenv("MONGO_DB_NAME")).Collection(os.Getenv("MONGO_COLLECTION_NAME"))}
-
-	var wg sync.WaitGroup
-	// record := &kgo.Record{Topic: "kafka-test", Value: []byte("hello world")}
-	// kafkaClient.Produce(ctx, record, func(r *kgo.Record, err error) {
-	// 	defer wg.Done()
-	// 	if err != nil {
-	// 		log.Fatal("record produce failed: %v\n", err)
-	// 	}
-	// })
 
 	for {
 		fetches := kafkaClient.PollFetches(ctx)
@@ -96,7 +197,7 @@ func main() {
 		for !iter.Done() {
 			fmt.Println("received record")
 			record := iter.Next()
-			processSiteFromQueue(string(record.Value), &sitesCollection, kafkaClient)
+			processSiteFromQueue(string(record.Value), &sitesCollection, kafkaClient, s3Client)
 		}
 
 	}
