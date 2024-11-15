@@ -37,15 +37,24 @@ type SiteRecord struct {
 	Content       string `bson:"content"`
 }
 
-func getS3KeyFromLink(link string) (string, error) {
+type SiteLink struct {
+	Host string
+	Path string
+}
+
+func (s SiteLink) String() string {
+	return s.Host + s.Path
+}
+
+func getS3KeyFromLink(link string) (SiteLink, error) {
 	// extract host and path from link, e.g.
 	// removes protocol and query params
 	// https://google.com/search -> google.com/search
 	u, err := url.Parse(link)
 	if err != nil {
-		return "", err
+		return SiteLink{}, err
 	}
-	return u.Host + u.Path, nil
+	return SiteLink{Host: u.Host, Path: u.Path}, nil
 }
 
 func getSiteDataFromS3(key string, s3Client *s3.Client) (io.ReadCloser, error) {
@@ -74,7 +83,19 @@ func addLinkToFetchQueue(link string, kafkaClient *kgo.Client) {
 	)
 }
 
-func processHtml(htmlTokenizer *html.Tokenizer, kafkaClient *kgo.Client) string {
+func isRelativeLink(link string) bool {
+	return strings.HasPrefix(link, "/") || strings.HasPrefix(link, "./")
+}
+
+func toActualLink(siteLink *SiteLink, link string) string {
+	if isRelativeLink(link) {
+		link = strings.TrimPrefix(link, ".")
+		return siteLink.Host + link
+	}
+	return link
+}
+
+func processHtml(htmlTokenizer *html.Tokenizer, siteLink *SiteLink, kafkaClient *kgo.Client) string {
 	// parse html
 	previousStartToken := htmlTokenizer.Token()
 	textContent := ""
@@ -91,9 +112,13 @@ tokenParseLoop:
 				for _, attr := range token.Attr {
 					if attr.Key == "href" {
 						fmt.Println("Found link: ", attr.Val)
-						addLinkToFetchQueue(attr.Val, kafkaClient)
+						actualLink := toActualLink(siteLink, attr.Val)
+
+						addLinkToFetchQueue(actualLink, kafkaClient)
 					}
 				}
+			} else if token.Data == "br" {
+				textContent += "\n"
 			}
 		} else if tokenType == html.TextToken {
 			if previousStartToken.Data == "script" || previousStartToken.Data == "style" {
@@ -117,7 +142,7 @@ func processSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient
 	}
 
 	// get raw html from s3
-	s3Result, err := getSiteDataFromS3(siteLink, s3Client)
+	s3Result, err := getSiteDataFromS3(siteLink.String(), s3Client)
 	if err != nil {
 		log.Printf("failed to get site data from S3: %v, skipping...\n", err)
 		return
@@ -126,13 +151,13 @@ func processSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient
 
 	htmlTokenizer := html.NewTokenizer(s3Result)
 
-	textContent := processHtml(htmlTokenizer, kafkaClient)
+	textContent := processHtml(htmlTokenizer, &siteLink, kafkaClient)
 	fmt.Println("extracted text content: ", textContent)
 
 	// update site record in mongo
 	res, err := mongoClient.collection.UpdateOne(
 		context.Background(),
-		bson.D{{Key: "url", Value: siteLink}},
+		bson.D{{Key: "url", Value: siteLink.String()}},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "content", Value: textContent},
 			{Key: "last_updated", Value: time.Now().Unix()},
@@ -143,7 +168,7 @@ func processSiteFromQueue(link string, mongoClient *MongoCollection, kafkaClient
 	}
 
 	if res.MatchedCount == 0 {
-		log.Fatalf("record not found for link %v", siteLink)
+		log.Fatalf("record not found for link %v", siteLink.String())
 	}
 
 	fmt.Println("updated site record for site ", link)
@@ -160,7 +185,7 @@ func main() {
 	//s3 connection
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		log.Fatal("failed to aws load configuration, %v", err)
+		log.Fatalf("failed to aws load configuration, %v", err)
 	}
 
 	s3Client := s3.NewFromConfig(cfg)
@@ -181,7 +206,7 @@ func main() {
 
 	mongoClient, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("MONGO_URL")))
 	if err != nil {
-		log.Fatal("failed to connect to mongo: %v\n", err)
+		log.Fatalf("failed to connect to mongo: %v\n", err)
 	}
 	fmt.Println("Mongo client connected")
 	defer mongoClient.Disconnect(ctx)
@@ -191,7 +216,7 @@ func main() {
 	for {
 		fetches := kafkaClient.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
-			log.Fatal("fetches had errors: %v\n", errs)
+			log.Fatalf("fetches had errors: %v\n", errs)
 		}
 		iter := fetches.RecordIter()
 		for !iter.Done() {
