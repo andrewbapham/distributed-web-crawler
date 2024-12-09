@@ -111,9 +111,9 @@ tokenParseLoop:
 			if token.Data == "a" {
 				for _, attr := range token.Attr {
 					if attr.Key == "href" {
-						fmt.Println("Found link: ", attr.Val)
 						actualLink := toActualLink(siteLink, attr.Val)
 
+						fmt.Println("Found link: ", attr.Val, " -> ", actualLink)
 						addLinkToFetchQueue(actualLink, kafkaClient)
 					}
 				}
