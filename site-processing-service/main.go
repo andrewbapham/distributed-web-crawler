@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,11 @@ type MongoCollection struct {
 
 type KafkaClient struct {
 	client *kgo.Client
+}
+
+type SiteKafkaMessage struct {
+	Link       string `json:"link"`
+	RetryCount int    `json:"retry_count"`
 }
 
 type SiteRecord struct {
@@ -72,9 +78,16 @@ func getSiteDataFromS3(key string, s3Client *s3.Client) (io.ReadCloser, error) {
 
 func addLinkToFetchQueue(link string, kafkaClient *kgo.Client) {
 	fmt.Println("Adding link to fetch queue: ", link)
+	siteKafkaMessage := SiteKafkaMessage{Link: link, RetryCount: 0}
+	messageJson, err := json.Marshal(siteKafkaMessage)
+	if err != nil {
+		log.Fatalf("failed to marshal message: %v", err)
+		return
+	}
+
 	kafkaClient.Produce(context.Background(), &kgo.Record{
 		Topic: os.Getenv("KAFKA_TOPIC_FETCH"),
-		Value: []byte(link),
+		Value: messageJson,
 	}, func(record *kgo.Record, err error) {
 		if err != nil {
 			log.Printf("failed to produce record: %v\n", err)
